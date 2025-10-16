@@ -43,22 +43,116 @@ class SimpleAdapter(nn.Module):
 
         return out
     
+    # def process_camera_coordinates(
+    #     self,
+    #     direction: Literal["Left", "Right", "Up", "Down", "LeftUp", "LeftDown", "RightUp", "RightDown"],
+    #     length: int,
+    #     height: int,
+    #     width: int,
+    #     speed: float = 1/54,
+    #     origin=(0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)
+    # ):
+    #     if origin is None:
+    #         origin = (0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)
+    #     coordinates = generate_camera_coordinates(direction, length, speed, origin)
+    #     plucker_embedding = process_pose_file(coordinates, width, height)
+    #     return plucker_embedding
+    
     def process_camera_coordinates(
         self,
-        direction: Literal["Left", "Right", "Up", "Down", "LeftUp", "LeftDown", "RightUp", "RightDown"],
+        annotation_path: str,
         length: int,
         height: int,
-        width: int,
-        speed: float = 1/54,
-        origin=(0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)
+        width: int
     ):
-        if origin is None:
-            origin = (0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0)
-        coordinates = generate_camera_coordinates(direction, length, speed, origin)
+        intrinsics = np.load(os.path.join(annotation_path, "intrinsics.npy"))
+        extrinsics = pose_from_quaternion(np.load(os.path.join(annotation_path, "poses.npy")))
+        # coordinates: i, fx, fy, cx, cy, 0, 0, r11, r12, r13, t1, r21, r22, r23, t2, r31, r32, r33, t3
+        coordinates = []
+        for i in range(length):
+            coordinate = [0]
+            coordinate.extend(intrinsics[i].tolist())
+            coordinate.extend([0, 0])  # Placeholder for alignment
+            coordinate.extend(extrinsics[i].flatten().tolist())
+            coordinates.append(coordinate)
         plucker_embedding = process_pose_file(coordinates, width, height)
         return plucker_embedding
-        
+
+def quaternion_to_matrix(quaternions, eps: float = 1e-8):
+    """
+    Convert 4-dimensional quaternions to 3x3 rotation matrices using NumPy.
     
+    Args:
+        quaternions: Quaternion array [..., 4] (order: i, j, k, r)
+        eps: Small value for numerical stability
+        
+    Returns:
+        Rotation matrices [..., 3, 3]
+    """
+    # 分离四元数的各个分量
+    i, j, k, r = np.split(quaternions, 4, axis=-1)
+    i = np.squeeze(i, axis=-1)
+    j = np.squeeze(j, axis=-1)
+    k = np.squeeze(k, axis=-1)
+    r = np.squeeze(r, axis=-1)
+    
+    # 计算归一化因子
+    two_s = 2 / (np.sum(quaternions ** 2, axis=-1) + eps)
+    
+    # 构建旋转矩阵的元素
+    elements = [
+        1 - two_s * (j **2 + k** 2),
+        two_s * (i * j - k * r),
+        two_s * (i * k + j * r),
+        two_s * (i * j + k * r),
+        1 - two_s * (i **2 + k** 2),
+        two_s * (j * k - i * r),
+        two_s * (i * k - j * r),
+        two_s * (j * k + i * r),
+        1 - two_s * (i **2 + j** 2),
+    ]
+    
+    # 堆叠元素并重塑为3x3矩阵
+    o = np.stack(elements, axis=-1)
+    return o.reshape(*o.shape[:-1], 3, 3)
+
+def pose_from_quaternion(pose):
+    """
+    Convert pose from quaternion representation to transformation matrix using NumPy.
+    
+    Args:
+        pose: Pose array [..., 7] where first 3 elements are translation (t)
+            and last 4 elements are quaternion rotation (r)
+            
+    Returns:
+        w2c_matrix: World-to-camera transformation matrices [..., 3, 4]
+    """
+    # 确保输入是NumPy数组
+    if isinstance(pose, np.ndarray):
+        pass  # 已经是NumPy数组，无需处理
+    else:
+        pose = np.array(pose)
+    
+    # 处理一维输入的情况
+    if len(pose.shape) == 1:
+        pose = pose[np.newaxis, :]
+    
+    # 分离平移和旋转分量
+    quat_t = pose[..., :3]  # 平移部分
+    quat_r = pose[..., 3:]  # 四元数旋转部分
+    
+    # 初始化变换矩阵
+    shape = (*pose.shape[:-1], 3, 4)
+    w2c_matrix = np.zeros(shape, dtype=pose.dtype)
+    
+    # 设置平移部分
+    w2c_matrix[..., :3, 3] = quat_t
+    
+    # 计算并设置旋转矩阵部分
+    w2c_matrix[..., :3, :3] = quaternion_to_matrix(quat_r)
+    
+    return w2c_matrix
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, dim):
