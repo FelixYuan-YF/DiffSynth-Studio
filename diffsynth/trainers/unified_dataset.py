@@ -114,6 +114,34 @@ class ToList(DataProcessingOperator):
     
 
 
+# class LoadVideo(DataProcessingOperator):
+#     def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x):
+#         self.num_frames = num_frames
+#         self.time_division_factor = time_division_factor
+#         self.time_division_remainder = time_division_remainder
+#         # frame_processor is build in the video loader for high efficiency.
+#         self.frame_processor = frame_processor
+        
+#     def get_num_frames(self, reader):
+#         num_frames = self.num_frames
+#         if int(reader.count_frames()) < num_frames:
+#             num_frames = int(reader.count_frames())
+#             while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
+#                 num_frames -= 1
+#         return num_frames
+        
+#     def __call__(self, data: str):
+#         reader = imageio.get_reader(data)
+#         num_frames = self.get_num_frames(reader)
+#         frames = []
+#         for frame_id in range(num_frames):
+#             frame = reader.get_data(frame_id)
+#             frame = Image.fromarray(frame)
+#             frame = self.frame_processor(frame)
+#             frames.append(frame)
+#         reader.close()
+#         return frames
+
 class LoadVideo(DataProcessingOperator):
     def __init__(self, num_frames=81, time_division_factor=4, time_division_remainder=1, frame_processor=lambda x: x):
         self.num_frames = num_frames
@@ -122,26 +150,27 @@ class LoadVideo(DataProcessingOperator):
         # frame_processor is build in the video loader for high efficiency.
         self.frame_processor = frame_processor
         
-    def get_num_frames(self, reader):
-        num_frames = self.num_frames
+    def get_num_frames(self, reader, interval):
+        num_frames = self.num_frames * interval
         if int(reader.count_frames()) < num_frames:
-            num_frames = int(reader.count_frames())
+            num_frames = int(reader.count_frames()) // interval
             while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
                 num_frames -= 1
         return num_frames
         
     def __call__(self, data: str):
         reader = imageio.get_reader(data)
-        num_frames = self.get_num_frames(reader)
+        video_fps = reader.get_meta_data()['fps']
+        interval = int(0.2 * video_fps)
+        num_frames = self.get_num_frames(reader, interval)
         frames = []
         for frame_id in range(num_frames):
-            frame = reader.get_data(frame_id)
+            frame = reader.get_data(frame_id * interval)
             frame = Image.fromarray(frame)
             frame = self.frame_processor(frame)
             frames.append(frame)
         reader.close()
         return frames
-
 
 
 class SequencialProcess(DataProcessingOperator):
@@ -227,7 +256,7 @@ class ToAbsolutePath(DataProcessingOperator):
 
 
 
-class UnifiedDataset(torch.utils.data.Dataset):
+class UnifiedDataset(torch.utils.data.Dataset): # 4n+1, maximum 81 frames
     def __init__(
         self,
         base_path=None, metadata_path=None,
