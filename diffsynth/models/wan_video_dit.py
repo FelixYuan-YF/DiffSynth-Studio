@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any
 from einops import rearrange
 from .wan_video_camera_controller import SimpleAdapter
 from ..core.gradient import gradient_checkpoint_forward
@@ -136,29 +136,105 @@ class AttentionModule(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+    def __init__(self, dim: int, num_heads: int, window_size: Tuple[int, int] = (-1, -1), qk_norm: bool = True, eps: float = 1e-6, pos_encoder: str = "plucker", prope_config: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.window_size = window_size
+        self.pos_encoder = pos_encoder
 
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
         self.v = nn.Linear(dim, dim)
         self.o = nn.Linear(dim, dim)
-        self.norm_q = RMSNorm(dim, eps=eps)
-        self.norm_k = RMSNorm(dim, eps=eps)
-        
-        self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x, freqs):
+        if qk_norm:
+            self.norm_q = RMSNorm(dim, eps=eps)
+            self.norm_k = RMSNorm(dim, eps=eps)
+        else:
+            self.norm_q = nn.Identity()
+            self.norm_k = nn.Identity()
+
+        self.attn = AttentionModule(self.num_heads)
+        if pos_encoder == "prope":
+            from .wan_video_camera_controller import prope_qkv
+            self.prope_qkv_fn = prope_qkv
+            self.o_prope = nn.Linear(dim, dim)
+            if not self.o_prope.weight.is_meta:
+                nn.init.zeros_(self.o_prope.weight)
+            if self.o_prope.bias is not None and not self.o_prope.bias.is_meta:
+                nn.init.zeros_(self.o_prope.bias)
+
+    def forward(self, x, freqs, prope_viewmats=None, prope_Ks=None, video_shape=None):
+        """Forward pass.
+
+        Args:
+            x: token sequence, shape (batch, seqlen, dim).
+            freqs: RoPE frequencies (used only for the standard path).
+            prope_viewmats: camera-to-world / world-to-camera matrices, shape
+                (batch, cameras, 4, 4).  Required when ``pos_encoder="prope"``.
+            prope_Ks: intrinsic matrices, shape (batch, cameras, 3, 3).  Optional
+                even for PRoPE (falls back to the GTA formula when None).
+            video_shape: (frames, height_patches, width_patches).  When
+                provided the PRoPE patch grid is lazily reconfigured to match
+                the current video resolution.
+        """
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
-        q = rope_apply(q, freqs, self.num_heads)
-        k = rope_apply(k, freqs, self.num_heads)
-        x = self.attn(q, k, v)
-        return self.o(x)
+
+        if self.pos_encoder == "prope" and prope_viewmats is not None:
+            # Dual-pathway logic: Original RoPE + PRoPE
+            w_patches = 40
+            h_patches = 22
+            if video_shape is not None:
+                frames, h_patches, w_patches = video_shape
+
+            # RoPE path: reuse self.attn directly (same as the else branch below)
+            q_rope = rope_apply(q, freqs, self.num_heads)
+            k_rope = rope_apply(k, freqs, self.num_heads)
+            out_rope = self.attn(q_rope, k_rope, v)
+
+            # PRoPE Path: run matrix transforms in float32 to avoid bfloat16
+            # numerical instability when P_inv contains large translation values
+            # (subsequent frames with camera motion). Cast back to original dtype
+            # before the attention kernel and final projection.
+            orig_dtype = q.dtype
+            q_bnsd = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads).float()
+            k_bnsd = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads).float()
+            v_bnsd = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads).float()
+
+            q_prope_bnsd, k_prope_bnsd, v_prope_bnsd, apply_fn_o = self.prope_qkv_fn(
+                q_bnsd, k_bnsd, v_bnsd,
+                viewmats=prope_viewmats.float(),
+                Ks=prope_Ks.float() if prope_Ks is not None else None,
+                patches_x=w_patches,
+                patches_y=h_patches,
+            )
+
+            # Move PRoPE features back to b s (n d) and cast to original dtype
+            q_prope = rearrange(q_prope_bnsd, "b n s d -> b s (n d)").to(orig_dtype)
+            k_prope = rearrange(k_prope_bnsd, "b n s d -> b s (n d)").to(orig_dtype)
+            v_prope = rearrange(v_prope_bnsd, "b n s d -> b s (n d)").to(orig_dtype)
+
+            # PRoPE attention (reuse self.attn, same backend as RoPE path)
+            out_prope = self.attn(q_prope, k_prope, v_prope)
+
+            # Post-process PRoPE output: apply_fn_o (P matrix) in float32 to
+            # match the float32 P_inv used in prope_qkv_fn, then cast back.
+            out_prope_bnsd = rearrange(out_prope, "b s (n d) -> b n s d", n=self.num_heads).float()
+            out_prope_bnsd = apply_fn_o(out_prope_bnsd)
+            out_prope = rearrange(out_prope_bnsd, "b n s d -> b s (n d)").to(orig_dtype)
+
+            # Project through standard output matching and sum
+            x = self.o(out_rope) + self.o_prope(out_prope)
+            return x
+        else:
+            q = rope_apply(q, freqs, self.num_heads)
+            k = rope_apply(k, freqs, self.num_heads)
+            x = self.attn(q, k, v)
+            return self.o(x)
 
 
 class CrossAttention(nn.Module):
@@ -208,13 +284,14 @@ class GateModule(nn.Module):
         return x + gate * residual
 
 class DiTBlock(nn.Module):
-    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, window_size: Tuple[int, int] = (-1, -1), eps: float = 1e-6,
+                 pos_encoder: str = "plucker", prope_config: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim
 
-        self.self_attn = SelfAttention(dim, num_heads, eps)
+        self.self_attn = SelfAttention(dim, num_heads, window_size, eps=eps, pos_encoder=pos_encoder, prope_config=prope_config)
         self.cross_attn = CrossAttention(
             dim, num_heads, eps, has_image_input=has_image_input)
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
@@ -225,7 +302,7 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs):
+    def forward(self, x, context, t_mod, freqs, prope_viewmats=None, prope_Ks=None, video_shape=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -237,7 +314,7 @@ class DiTBlock(nn.Module):
                 shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs, prope_viewmats=prope_viewmats, prope_Ks=prope_Ks, video_shape=video_shape))
         x = x + self.cross_attn(self.norm3(x), context)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -300,11 +377,14 @@ class WanModel(torch.nn.Module):
         has_image_pos_emb: bool = False,
         has_ref_conv: bool = False,
         add_control_adapter: bool = False,
-        in_dim_control_adapter: int = 24,
+        in_dim_control_adapter: Optional[int] = None,
         seperated_timestep: bool = False,
         require_vae_embedding: bool = True,
         require_clip_embedding: bool = True,
         fuse_vae_embedding_in_latents: bool = False,
+        # Positional encoding mode
+        pos_encoder: str = "plucker", # "plucker" or "prope"
+        prope_config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -316,6 +396,7 @@ class WanModel(torch.nn.Module):
         self.require_vae_embedding = require_vae_embedding
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
+        self.pos_encoder = pos_encoder
 
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
@@ -332,7 +413,8 @@ class WanModel(torch.nn.Module):
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, dim * 6))
         self.blocks = nn.ModuleList([
-            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps)
+            DiTBlock(has_image_input, dim, num_heads, ffn_dim, eps,
+                     pos_encoder=pos_encoder, prope_config=prope_config)
             for _ in range(num_layers)
         ])
         self.head = Head(dim, out_dim, patch_size, eps)
@@ -345,6 +427,8 @@ class WanModel(torch.nn.Module):
             self.ref_conv = nn.Conv2d(16, dim, kernel_size=(2, 2), stride=(2, 2))
         self.has_image_pos_emb = has_image_pos_emb
         self.has_ref_conv = has_ref_conv
+        # We build control_adapter even if pos_encoder=="prope" to satisfy checkpoint 
+        # weight loading, but bypass its forward pass in patchify.
         if add_control_adapter:
             self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:])
         else:
@@ -352,11 +436,40 @@ class WanModel(torch.nn.Module):
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)
-        if self.control_adapter is not None and control_camera_latents_input is not None:
+        bypass_adapter = self.pos_encoder == "prope"
+        if self.control_adapter is not None and control_camera_latents_input is not None and not bypass_adapter:
             y_camera = self.control_adapter(control_camera_latents_input)
             x = [u + v for u, v in zip(x, y_camera)]
             x = x[0].unsqueeze(0)
         return x
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        # PRoPE branch introduces missing keys (o_prope weights) in the pre-trained state dictionary.
+        # We allow missing keys here by enforcing strict=False, but manually verify that only o_prope is missing.
+        missing_keys, unexpected_keys = super().load_state_dict(state_dict, strict=False, assign=assign)
+        if strict:
+            unexpected_missing = [k for k in missing_keys if "o_prope" not in k]
+            if len(unexpected_missing) > 0 or len(unexpected_keys) > 0:
+                error_msg = "Error(s) in loading state_dict for WanModel:\n"
+                if len(unexpected_missing) > 0:
+                    error_msg += f"Missing key(s) in state_dict: {unexpected_missing}\n"
+                if len(unexpected_keys) > 0:
+                    error_msg += f"Unexpected key(s) in state_dict: {unexpected_keys}\n"
+                raise RuntimeError(error_msg)
+        
+        # Initialize o_prope meta-tensors so that `to(device)` does not fail.
+        try:
+            for module in self.modules():
+                if hasattr(module, 'o_prope'):
+                    o_prope = module.o_prope
+                    if o_prope.weight.is_meta:
+                        o_prope.weight = torch.nn.Parameter(torch.zeros_like(o_prope.weight, device='cpu'))
+                    if o_prope.bias is not None and o_prope.bias.is_meta:
+                        o_prope.bias = torch.nn.Parameter(torch.zeros_like(o_prope.bias, device='cpu'))
+        except Exception:
+            pass
+
+        return missing_keys, unexpected_keys
 
     def unpatchify(self, x: torch.Tensor, grid_size: torch.Tensor):
         return rearrange(
@@ -373,6 +486,8 @@ class WanModel(torch.nn.Module):
                 y: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing: bool = False,
                 use_gradient_checkpointing_offload: bool = False,
+                viewmats: Optional[torch.Tensor] = None,
+                Ks: Optional[torch.Tensor] = None,
                 **kwargs,
                 ):
         t = self.time_embedding(
@@ -385,7 +500,9 @@ class WanModel(torch.nn.Module):
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
         
-        x, (f, h, w) = self.patchify(x)
+        x = self.patchify(x, control_camera_latents_input=kwargs.get("control_camera_latents_input", None))
+        _, _, f, h, w = x.shape
+        x = rearrange(x, 'b c f h w -> b (f h w) c')
         
         freqs = torch.cat([
             self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -393,16 +510,19 @@ class WanModel(torch.nn.Module):
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
+        # Pass video shape to PRoPE so it can lazily reconfigure the patch grid.
+        video_shape = (f, h, w) if self.pos_encoder == "prope" else None
         for block in self.blocks:
             if self.training:
                 x = gradient_checkpoint_forward(
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs,
+                    prope_viewmats=viewmats, prope_Ks=Ks, video_shape=video_shape
                 )
             else:
-                x = block(x, context, t_mod, freqs)
+                x = block(x, context, t_mod, freqs, prope_viewmats=viewmats, prope_Ks=Ks, video_shape=video_shape)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))

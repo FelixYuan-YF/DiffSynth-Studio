@@ -201,6 +201,8 @@ class WanVideoPipeline(BasePipeline):
         camera_control_direction: Optional[Literal["Left", "Right", "Up", "Down", "LeftUp", "LeftDown", "RightUp", "RightDown"]] = None,
         camera_control_speed: Optional[float] = 1/54,
         camera_control_origin: Optional[tuple] = (0, 0.532139961, 0.946026558, 0.5, 0.5, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0),
+        camera_control_param: Optional[list] = None,  # List of RealEstate10K tuples: (i,fx,fy,cx,cy,0,0,r11..r33,t1..t3)
+        norm_poses: Optional[bool] = False,
         # VACE
         vace_video: Optional[list[Image.Image]] = None,
         vace_video_mask: Optional[Image.Image] = None,
@@ -268,6 +270,9 @@ class WanVideoPipeline(BasePipeline):
             "input_video": input_video, "denoising_strength": denoising_strength,
             "control_video": control_video, "reference_image": reference_image,
             "camera_control_direction": camera_control_direction, "camera_control_speed": camera_control_speed, "camera_control_origin": camera_control_origin,
+            "camera_control_param": camera_control_param,
+            "camera_viewmats": None, "camera_Ks": None,
+            "norm_poses": norm_poses,
             "vace_video": vace_video, "vace_video_mask": vace_video_mask, "vace_reference_image": vace_reference_image, "vace_scale": vace_scale,
             "seed": seed, "rand_device": rand_device,
             "height": height, "width": width, "num_frames": num_frames,
@@ -555,30 +560,79 @@ class WanVideoUnit_FunReference(PipelineUnit):
 class WanVideoUnit_FunCameraControl(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("height", "width", "num_frames", "camera_control_direction", "camera_control_speed", "camera_control_origin", "latents", "input_image", "tiled", "tile_size", "tile_stride"),
-            output_params=("control_camera_latents_input", "y"),
+            input_params=("height", "width", "num_frames", "camera_control_direction", "camera_control_speed", "camera_control_origin", "camera_control_param", "latents", "input_image", "tiled", "tile_size", "tile_stride", "norm_poses"),
+            output_params=("control_camera_latents_input", "camera_viewmats", "camera_Ks", "y"),
             onload_model_names=("vae",)
         )
 
-    def process(self, pipe: WanVideoPipeline, height, width, num_frames, camera_control_direction, camera_control_speed, camera_control_origin, latents, input_image, tiled, tile_size, tile_stride):
-        if camera_control_direction is None:
+    def process(self, pipe: WanVideoPipeline, height, width, num_frames, camera_control_direction, camera_control_speed, camera_control_origin, camera_control_param, latents, input_image, tiled, tile_size, tile_stride, norm_poses=False):
+        # Determine whether we have any camera input
+        if camera_control_param is None and camera_control_direction is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        camera_control_plucker_embedding = pipe.dit.control_adapter.process_camera_coordinates(
-            camera_control_direction, num_frames, height, width, camera_control_speed, camera_control_origin)
-        
-        control_camera_video = camera_control_plucker_embedding[:num_frames].permute([3, 0, 1, 2]).unsqueeze(0)
-        control_camera_latents = torch.concat(
-            [
-                torch.repeat_interleave(control_camera_video[:, :, 0:1], repeats=4, dim=2),
-                control_camera_video[:, :, 1:]
-            ], dim=2
-        ).transpose(1, 2)
-        b, f, c, h, w = control_camera_latents.shape
-        control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, 4, c, h, w).transpose(2, 3)
-        control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, c * 4, h, w).transpose(1, 2)
-        control_camera_latents_input = control_camera_latents.to(device=pipe.device, dtype=pipe.torch_dtype)
-        
+
+        # ------------------------------------------------------------------ #
+        # 1. Resolve camera parameters into a list of Camera objects          #
+        # ------------------------------------------------------------------ #
+        from ..models.wan_video_camera_controller import (
+            Camera, generate_camera_coordinates, get_relative_pose,
+        )
+        import numpy as np
+
+        if camera_control_param is not None:
+            if isinstance(camera_control_param, str):
+                import os as _os
+                if _os.path.isfile(camera_control_param):
+                    with open(camera_control_param, "r") as _f:
+                        lines = [l.strip() for l in _f if l.strip()]
+                    camera_control_param_list = [[float(v) for v in (l.replace(",", " ").split())] for l in lines]
+                else:
+                    raise FileNotFoundError(f"camera_control_param file not found: {camera_control_param}")
+            assert len(camera_control_param_list) >= num_frames, f"camera_control_param must have at least {num_frames} frames, but {camera_control_param} only got {len(camera_control_param_list)} frames"
+            raw_params = list(camera_control_param_list)[:num_frames]
+        else:
+            raw_params = generate_camera_coordinates(camera_control_direction, num_frames, camera_control_speed, camera_control_origin)[:num_frames]
+
+        cam_params = [Camera(c) for c in raw_params]
+
+        # ------------------------------------------------------------------ #
+        # 2. Optional pose normalization                                       #
+        # ------------------------------------------------------------------ #
+        if norm_poses:
+            translations = np.array([[c.c2w_mat[0, 3], c.c2w_mat[1, 3], c.c2w_mat[2, 3]] for c in cam_params])
+            diffs = translations[:, None, :] - translations[None, :, :]
+            max_dist = float(np.linalg.norm(diffs, axis=-1).max())
+            if max_dist > 1e-6:
+                scale = 1.0 / max_dist
+                for cam in cam_params:
+                    cam.c2w_mat[0, 3] *= scale
+                    cam.c2w_mat[1, 3] *= scale
+                    cam.c2w_mat[2, 3] *= scale
+                    cam.w2c_mat = np.linalg.inv(cam.c2w_mat)
+
+        # ------------------------------------------------------------------ #
+        # 3. Adjust intrinsics for video aspect ratio (Common logic)          #
+        # ------------------------------------------------------------------ #
+        original_pose_width, original_pose_height = 1280, 720
+        sample_wh_ratio = width / height
+        pose_wh_ratio = original_pose_width / original_pose_height
+        if pose_wh_ratio > sample_wh_ratio:
+            resized_ori_w = height * pose_wh_ratio
+            for cam_param in cam_params:
+                cam_param.fx = resized_ori_w * cam_param.fx / width
+        else:
+            resized_ori_h = width / pose_wh_ratio
+            for cam_param in cam_params:
+                cam_param.fy = resized_ori_h * cam_param.fy / height
+
+        # ------------------------------------------------------------------ #
+        # 4. Compute Relative Poses (Common logic)                            #
+        # ------------------------------------------------------------------ #
+        c2ws = get_relative_pose(cam_params)  # (num_frames, 4, 4)
+
+        # ------------------------------------------------------------------ #
+        # 5. Build conditioning latents 'y' (Common logic)                    #
+        # ------------------------------------------------------------------ #
         input_image = input_image.resize((width, height))
         input_latents = pipe.preprocess_video([input_image])
         input_latents = pipe.vae.encode(input_latents, device=pipe.device)
@@ -588,18 +642,59 @@ class WanVideoUnit_FunCameraControl(PipelineUnit):
 
         if y.shape[1] != pipe.dit.in_dim - latents.shape[1]:
             image = pipe.preprocess_image(input_image.resize((width, height))).to(pipe.device)
-            vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, num_frames-1, height, width).to(image.device)], dim=1)
+            vae_input = torch.concat([image.transpose(0, 1), torch.zeros(3, num_frames - 1, height, width).to(image.device)], dim=1)
             y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
             y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
-            msk = torch.ones(1, num_frames, height//8, width//8, device=pipe.device)
+            msk = torch.ones(1, num_frames, height // 8, width // 8, device=pipe.device)
             msk[:, 1:] = 0
             msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
-            msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
+            msk = msk.view(1, msk.shape[1] // 4, 4, height // 8, width // 8)
             msk = msk.transpose(1, 2)[0]
-            y = torch.cat([msk,y])
+            y = torch.cat([msk, y])
             y = y.unsqueeze(0)
             y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
-        return {"control_camera_latents_input": control_camera_latents_input, "y": y}
+
+        # ------------------------------------------------------------------ #
+        # 6. Branch based on positional encoder mode                          #
+        # ------------------------------------------------------------------ #
+        if getattr(pipe.dit, "pos_encoder", "plucker") == "prope":
+            # Sample camera poses for each latent frame
+            # The indices align with the Plucker grouping logic (indices [0, 1, 5, 9, ...])
+            v_comp = pipe.time_division_factor
+            v_rem = pipe.time_division_remainder
+            latent_frames = (len(cam_params) - v_rem) // v_comp + 1
+            latent_indices = [0] + [v_rem + v_comp * i for i in range(latent_frames - 1)]
+            
+            # Prepare viewmats (inverse of relative c2w)
+            c2ws_tensor = torch.as_tensor(c2ws[latent_indices], dtype=torch.float32, device=pipe.device)
+            viewmats = torch.linalg.inv(c2ws_tensor).unsqueeze(0)  # keep float32 for PRoPE precision
+
+            # Prepare intrinsics matrix K (Normalized like HY-WorldPlay)
+            cam_params_latent = [cam_params[i] for i in latent_indices]
+            Ks_np = np.array([[[c.fx, 0, 0.5], [0, c.fy, 0.5], [0, 0, 1]] for c in cam_params_latent], dtype=np.float32)
+            Ks = torch.as_tensor(Ks_np, dtype=torch.float32, device=pipe.device).unsqueeze(0)  # keep float32
+
+            return {"camera_viewmats": viewmats, "camera_Ks": Ks, "y": y}
+        else:
+            # Plucker path
+            intrinsic = np.asarray([[c.fx * width, c.fy * height, c.cx * width, c.cy * height] for c in cam_params], dtype=np.float32)
+            K = torch.as_tensor(intrinsic)[None]  # [1, num_frames, 4]
+            c2ws_tensor = torch.as_tensor(c2ws)[None]  # [1, num_frames, 4, 4]
+
+            from einops import rearrange as rearrange_
+            from ..models.wan_video_camera_controller import ray_condition
+            plucker_embedding = ray_condition(K, c2ws_tensor, height, width, device='cpu')[0].permute(0, 3, 1, 2).contiguous() # V,6,H,W
+            plucker_embedding = plucker_embedding[None] # 1,V,6,H,W
+            plucker_embedding = rearrange_(plucker_embedding, "b f c h w -> b f h w c")[0] # V,H,W,6
+
+            control_camera_video = plucker_embedding[:num_frames].permute([3, 0, 1, 2]).unsqueeze(0) # 1,6,F,H,W
+            control_camera_latents = torch.concat([torch.repeat_interleave(control_camera_video[:, :, 0:1], repeats=4, dim=2), control_camera_video[:, :, 1:]], dim=2).transpose(1, 2)
+            b, f, c, h, w = control_camera_latents.shape
+            control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, 4, c, h, w).transpose(2, 3)
+            control_camera_latents = control_camera_latents.contiguous().view(b, f // 4, c * 4, h, w).transpose(1, 2)
+            control_camera_latents_input = control_camera_latents.to(device=pipe.device, dtype=pipe.torch_dtype)
+
+            return {"control_camera_latents_input": control_camera_latents_input, "y": y}
 
 
 
@@ -1157,6 +1252,9 @@ def model_fn_wan_video(
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
     control_camera_latents_input = None,
+    # PRoPE camera params
+    camera_viewmats: Optional[torch.Tensor] = None,
+    camera_Ks: Optional[torch.Tensor] = None,
     fuse_vae_embedding_in_latents: bool = False,
     **kwargs,
 ):
@@ -1279,6 +1377,22 @@ def model_fn_wan_video(
         dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
+    # Determine PRoPE camera tensors (broadcast batch dim to match x if needed)
+    prope_viewmats = None
+    prope_Ks = None
+    if getattr(dit, "pos_encoder", "plucker") == "prope" and camera_viewmats is not None:
+        prope_viewmats = camera_viewmats.to(device=x.device)  # keep float32, no dtype cast
+        if x.shape[0] != prope_viewmats.shape[0]:
+            # Broadcast to handle cfg_merge (batch doubled)
+            prope_viewmats = prope_viewmats.expand(x.shape[0], -1, -1, -1)
+        if camera_Ks is not None:
+            prope_Ks = camera_Ks.to(device=x.device)  # keep float32, no dtype cast
+            if x.shape[0] != prope_Ks.shape[0]:
+                prope_Ks = prope_Ks.expand(x.shape[0], -1, -1, -1)
+
+    # video_shape for lazy PRoPE patch-grid reconfiguration
+    video_shape = (f, h, w) if getattr(dit, "pos_encoder", "plucker") == "prope" else None
+
     # VAP 
     if vap is not None:
         # hidden state
@@ -1349,7 +1463,8 @@ def model_fn_wan_video(
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs,
+                    prope_viewmats, prope_Ks, video_shape,
                 )
               
             

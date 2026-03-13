@@ -23,6 +23,8 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        pos_encoder="plucker",
+        norm_poses=False,
     ):
         super().__init__()
         # Warning
@@ -32,6 +34,16 @@ class WanTrainingModule(DiffusionTrainingModule):
         
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
+        
+        # Inject pos_encoder into the global model_configs so that WanModel
+        # instances built from MODEL_CONFIGS get the correct positional encoding mode.
+        from diffsynth.configs.model_configs import MODEL_CONFIGS as global_model_configs
+        for cfg in global_model_configs:
+            if cfg.get("model_name") == "wan_video_dit":
+                if "extra_kwargs" not in cfg:
+                    cfg["extra_kwargs"] = {}
+                cfg["extra_kwargs"]["pos_encoder"] = pos_encoder
+
         tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         audio_processor_config = self.parse_path_or_model_id(audio_processor_path)
         self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
@@ -61,6 +73,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
+        self.norm_poses = norm_poses
         
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -95,6 +108,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "vace_scale": 1,
             "max_timestep_boundary": self.max_timestep_boundary,
             "min_timestep_boundary": self.min_timestep_boundary,
+            "norm_poses": self.norm_poses,
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
@@ -117,6 +131,10 @@ def wan_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
+    parser.add_argument("--pos_encoder", type=str, default="plucker", choices=["plucker", "prope"], help="Type of camera relative positional encoding (plucker or prope).")
+    parser.add_argument("--norm_poses", default=False, action="store_true", help="Normalize camera translation scale so that the max pairwise distance equals 1.")
+    parser.add_argument("--frame_rate", type=float, default=24, help="Frame rate for video loading.")
+    parser.add_argument("--fix_frame_rate", default=False, action="store_true", help="Fix frame rate for video loading.")
     return parser
 
 
@@ -142,6 +160,8 @@ if __name__ == "__main__":
             num_frames=args.num_frames,
             time_division_factor=4,
             time_division_remainder=1,
+            frame_rate=args.frame_rate,
+            fix_frame_rate=args.fix_frame_rate,
         ),
         special_operator_map={
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
@@ -169,6 +189,8 @@ if __name__ == "__main__":
         device="cpu" if args.initialize_model_on_cpu else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        pos_encoder=args.pos_encoder,
+        norm_poses=args.norm_poses,
     )
     model_logger = ModelLogger(
         args.output_path,
