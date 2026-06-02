@@ -60,6 +60,14 @@ def add_gradient_config(parser: argparse.ArgumentParser):
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
     return parser
 
+def add_logging_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--log_backend", type=str, default="tensorboard", choices=["tensorboard", "wandb", "none"], help="Metrics logging backend: tensorboard, wandb, or none.")
+    parser.add_argument("--log_dir", type=str, default="./logs", help="Directory for metrics logs (used by TensorBoard).")
+    parser.add_argument("--wandb_project", type=str, default=None, help="WandB project name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name.")
+    parser.add_argument("--log_interval", type=int, default=1, help="Log metrics every N steps.")
+    return parser
+
 def add_general_config(parser: argparse.ArgumentParser):
     parser = add_dataset_base_config(parser)
     parser = add_model_config(parser)
@@ -67,4 +75,5 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_output_config(parser)
     parser = add_lora_config(parser)
     parser = add_gradient_config(parser)
+    parser = add_logging_config(parser)
     return parser

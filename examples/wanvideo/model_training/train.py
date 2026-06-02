@@ -25,6 +25,32 @@ class WanTrainingModule(DiffusionTrainingModule):
         min_timestep_boundary=0.0,
         pos_encoder="plucker",
         norm_poses=False,
+        # GRPO/GDPO 相关参数
+        num_generations=4,
+        rl_sampling_steps=10,
+        rl_eta=1.0,
+        rl_shift=5.0,
+        rl_cfg_scale=5.0,
+        rl_clip_range=1e-4,
+        rl_adv_clip_max=5.0,
+        rl_timestep_fraction=1.0,
+        rl_reward_output_dir="./rl_videos",
+        # Epipolar 奖励相关参数
+        epipolar_sampling_rate=15,
+        epipolar_descriptor_type="sift",
+        epipolar_ratio_thresh=0.75,
+        epipolar_min_matches=20,
+        # HPSv3 奖励相关参数
+        hpsv3_model_path="MizzenAI/HPSv3",
+        hpsv3_device=None,
+        # GRPO 奖励类型选择（支持多个奖励，如 ["epipolar", "hpsv3"]）
+        reward_type="epipolar",
+        # GDPO 专有：各奖励权重（dict，如 {"epipolar": 1.0, "hpsv3": 0.5}）
+        reward_weights=None,
+        # 视频尺寸
+        height=480,
+        width=832,
+        num_frames=81,
     ):
         super().__init__()
         # Warning
@@ -70,10 +96,48 @@ class WanTrainingModule(DiffusionTrainingModule):
             "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+            "grpo": FlowMatchGRPOLoss(
+                num_generations=num_generations,
+                sampling_steps=rl_sampling_steps,
+                eta=rl_eta,
+                shift=rl_shift,
+                cfg_scale=rl_cfg_scale,
+                clip_range=rl_clip_range,
+                adv_clip_max=rl_adv_clip_max,
+                timestep_fraction=rl_timestep_fraction,
+                reward_output_dir=rl_reward_output_dir,
+                reward_type=reward_type,
+                epipolar_sampling_rate=epipolar_sampling_rate,
+                epipolar_descriptor_type=epipolar_descriptor_type,
+                epipolar_ratio_thresh=epipolar_ratio_thresh,
+                epipolar_min_matches=epipolar_min_matches,
+                hpsv3_model_path=hpsv3_model_path,
+                hpsv3_device=hpsv3_device,
+            ),
+            "gdpo": FlowMatchGDPOLoss(
+                num_generations=num_generations,
+                sampling_steps=rl_sampling_steps,
+                eta=rl_eta,
+                shift=rl_shift,
+                cfg_scale=rl_cfg_scale,
+                clip_range=rl_clip_range,
+                adv_clip_max=rl_adv_clip_max,
+                timestep_fraction=rl_timestep_fraction,
+                reward_output_dir=rl_reward_output_dir,
+                epipolar_sampling_rate=epipolar_sampling_rate,
+                epipolar_descriptor_type=epipolar_descriptor_type,
+                epipolar_ratio_thresh=epipolar_ratio_thresh,
+                epipolar_min_matches=epipolar_min_matches,
+                hpsv3_model_path=hpsv3_model_path,
+                hpsv3_device=hpsv3_device,
+                reward_weights=reward_weights if reward_weights is not None else {"epipolar": 1.0},
+            ),
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
         self.norm_poses = norm_poses
+        # GRPO 视频尺寸参数
+        self.rl_cfg_scale = rl_cfg_scale
         
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
         for extra_input in extra_inputs:
@@ -85,31 +149,48 @@ class WanTrainingModule(DiffusionTrainingModule):
                 inputs_shared[extra_input] = data[extra_input][0]
             else:
                 inputs_shared[extra_input] = data[extra_input]
+        if inputs_shared.get("framewise_decoding", False):
+            # WanToDance global model
+            inputs_shared["num_frames"] = 4 * (len(data["video"]) - 1) + 1
         return inputs_shared
     
     def get_pipeline_inputs(self, data):
         inputs_posi = {"prompt": data["prompt"]}
-        inputs_nega = {}
-        inputs_shared = {
-            # Assume you are using this pipeline for inference,
-            # please fill in the input parameters.
-            "input_video": data["video"],
-            "height": data["video"][0].size[1],
-            "width": data["video"][0].size[0],
-            "num_frames": len(data["video"]),
-            # Please do not modify the following parameters
-            # unless you clearly know what this will cause.
-            "cfg_scale": 1,
-            "tiled": False,
-            "rand_device": self.pipe.device,
-            "use_gradient_checkpointing": self.use_gradient_checkpointing,
-            "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
-            "cfg_merge": False,
-            "vace_scale": 1,
-            "max_timestep_boundary": self.max_timestep_boundary,
-            "min_timestep_boundary": self.min_timestep_boundary,
-            "norm_poses": self.norm_poses,
-        }
+        inputs_nega = {"negative_prompt": data.get("negative_prompt", "")} if self.task in ("grpo", "gdpo") else {}
+        
+        if self.task in ("grpo", "gdpo"):
+            # GRPO: 视频由模型自己生成，使用指定的尺寸
+            inputs_shared = {
+                "height": data["video"][0].size[1],
+                "width": data["video"][0].size[0],
+                "num_frames": len(data["video"]),
+                "cfg_scale": self.rl_cfg_scale,
+                "tiled": False,
+                "rand_device": self.pipe.device,
+                "use_gradient_checkpointing": self.use_gradient_checkpointing,
+                "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+                "cfg_merge": False,
+                "norm_poses": self.norm_poses,
+            }
+        else:
+            # SFT: 从数据集中获取视频
+            inputs_shared = {
+                "input_video": data["video"],
+                "height": data["video"][0].size[1],
+                "width": data["video"][0].size[0],
+                "num_frames": len(data["video"]),
+                "cfg_scale": 1,
+                "tiled": False,
+                "rand_device": self.pipe.device,
+                "use_gradient_checkpointing": self.use_gradient_checkpointing,
+                "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+                "cfg_merge": False,
+                "vace_scale": 1,
+                "max_timestep_boundary": self.max_timestep_boundary,
+                "min_timestep_boundary": self.min_timestep_boundary,
+                "norm_poses": self.norm_poses,
+            }
+        
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
     
@@ -118,9 +199,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
-        loss = self.task_to_loss[self.task](self.pipe, *inputs)
-        return loss
-
+        result = self.task_to_loss[self.task](self.pipe, *inputs)
+        # GRPO 返回字典 {"loss": tensor, "metrics": {...}}，直接透传给 runner
+        return result
 
 def wan_parser():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -131,10 +212,33 @@ def wan_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
+    parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable it if this model is a WanToDance global model.")
     parser.add_argument("--pos_encoder", type=str, default="plucker", choices=["plucker", "prope"], help="Type of camera relative positional encoding (plucker or prope).")
     parser.add_argument("--norm_poses", default=False, action="store_true", help="Normalize camera translation scale so that the max pairwise distance equals 1.")
     parser.add_argument("--frame_rate", type=float, default=24, help="Frame rate for video loading.")
     parser.add_argument("--fix_frame_rate", default=False, action="store_true", help="Fix frame rate for video loading.")
+    # GRPO/GDPO 相关参数
+    parser.add_argument("--num_generations", type=int, default=4, help="每个 prompt 生成的视频数量（GRPO/GDPO 组大小）。")
+    parser.add_argument("--rl_sampling_steps", type=int, default=10, help="RL 阶段去噪步数。")
+    parser.add_argument("--rl_eta", type=float, default=1.0, help="SDE 噪声强度（>0 才能计算 log_prob）。")
+    parser.add_argument("--rl_shift", type=float, default=5.0, help="sigma 时间表非线性偏移系数。")
+    parser.add_argument("--rl_cfg_scale", type=float, default=5.0, help="Classifier-Free Guidance 强度（RL 阶段）。")
+    parser.add_argument("--rl_clip_range", type=float, default=1e-4, help="PPO clip 范围 ε。")
+    parser.add_argument("--rl_adv_clip_max", type=float, default=5.0, help="优势值截断上界。")
+    parser.add_argument("--rl_timestep_fraction", type=float, default=1.0, help="训练时使用的时间步比例（<1 可节省显存）。")
+    parser.add_argument("--rl_reward_output_dir", type=str, default="./rl_videos", help="生成视频保存目录（用于奖励计算）。")
+    # Epipolar 奖励相关参数
+    parser.add_argument("--epipolar_sampling_rate", type=int, default=15, help="Epipolar 评估时每隔 N 帧采样一次。")
+    parser.add_argument("--epipolar_descriptor_type", type=str, default="sift", choices=["sift", "lightglue"], help="特征描述子类型（sift 或 lightglue）。")
+    parser.add_argument("--epipolar_ratio_thresh", type=float, default=0.75, help="SIFT Lowe's ratio test 阈值。")
+    parser.add_argument("--epipolar_min_matches", type=int, default=20, help="最少匹配点数。")
+    # HPSv3 奖励相关参数
+    parser.add_argument("--hpsv3_model_path", type=str, default="MizzenAI/HPSv3", help="HPSv3 模型路径（本地路径或 HuggingFace model ID）。")
+    parser.add_argument("--hpsv3_device", type=str, default=None, help="HPSv3 模型运行设备（默认与 pipe 同设备）。")
+    # GRPO 奖励类型选择
+    parser.add_argument("--reward_type", type=str, default="epipolar", help="GRPO 使用的奖励类型，支持单个（如 'epipolar'）或多个（如 'epipolar,hpsv3'，用逗号分隔）。")
+    # GDPO 专有参数
+    parser.add_argument("--reward_weights", type=str, default=None, help="GDPO 各奖励权重，JSON 字符串，如 '{\"epipolar\": 1.0, \"hpsv3\": 0.5}'。")
     return parser
 
 
@@ -158,16 +262,22 @@ if __name__ == "__main__":
             height_division_factor=16,
             width_division_factor=16,
             num_frames=args.num_frames,
-            time_division_factor=4,
-            time_division_remainder=1,
+            time_division_factor=4 if not args.framewise_decoding else 1,
+            time_division_remainder=1 if not args.framewise_decoding else 0,
             frame_rate=args.frame_rate,
             fix_frame_rate=args.fix_frame_rate,
         ),
         special_operator_map={
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
             "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
+            "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
         }
     )
+    # 解析 GDPO reward_weights（JSON 字符串 → dict）
+    reward_weights = None
+    if getattr(args, "reward_weights", None) is not None:
+        import json
+        reward_weights = json.loads(args.reward_weights)
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -191,10 +301,38 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
         pos_encoder=args.pos_encoder,
         norm_poses=args.norm_poses,
+        # GRPO/GDPO 参数
+        num_generations=args.num_generations,
+        rl_sampling_steps=args.rl_sampling_steps,
+        rl_eta=args.rl_eta,
+        rl_shift=args.rl_shift,
+        rl_cfg_scale=args.rl_cfg_scale,
+        rl_clip_range=args.rl_clip_range,
+        rl_adv_clip_max=args.rl_adv_clip_max,
+        rl_timestep_fraction=args.rl_timestep_fraction,
+        rl_reward_output_dir=args.rl_reward_output_dir,
+        epipolar_sampling_rate=args.epipolar_sampling_rate,
+        epipolar_descriptor_type=args.epipolar_descriptor_type,
+        epipolar_ratio_thresh=args.epipolar_ratio_thresh,
+        epipolar_min_matches=args.epipolar_min_matches,
+        reward_type=[r.strip() for r in args.reward_type.split(',')],
+        reward_weights=reward_weights,
+        hpsv3_model_path=args.hpsv3_model_path,
+        hpsv3_device=args.hpsv3_device,
+        # 视频尺寸复用已有参数
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
     )
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
+        metrics_backend=getattr(args, 'log_backend', 'none'),
+        log_dir=getattr(args, 'log_dir', './logs'),
+        project_name=getattr(args, 'wandb_project', None),
+        run_name=getattr(args, 'wandb_run_name', None),
+        config=vars(args),
+        log_interval=getattr(args, 'log_interval', 1),
     )
     launcher_map = {
         "sft:data_process": launch_data_process_task,
@@ -203,5 +341,7 @@ if __name__ == "__main__":
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
+        "grpo": launch_rl_training_task,
+        "gdpo": launch_rl_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)

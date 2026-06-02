@@ -186,21 +186,21 @@ class SelfAttention(nn.Module):
 
         if self.pos_encoder == "prope" and prope_viewmats is not None:
             # Dual-pathway logic: Original RoPE + PRoPE
+            # Merge both paths into a single batched attention call for better
+            # GPU utilisation (one kernel launch instead of two).
             w_patches = 40
             h_patches = 22
             if video_shape is not None:
                 frames, h_patches, w_patches = video_shape
 
-            # RoPE path: reuse self.attn directly (same as the else branch below)
-            q_rope = rope_apply(q, freqs, self.num_heads)
-            k_rope = rope_apply(k, freqs, self.num_heads)
-            out_rope = self.attn(q_rope, k_rope, v)
-
-            # PRoPE Path: run matrix transforms in float32 to avoid bfloat16
-            # numerical instability when P_inv contains large translation values
-            # (subsequent frames with camera motion). Cast back to original dtype
-            # before the attention kernel and final projection.
             orig_dtype = q.dtype
+
+            # --- RoPE path: apply rotary embeddings to q/k ---
+            q_rope = rope_apply(q, freqs, self.num_heads)  # (b, s, n*d)
+            k_rope = rope_apply(k, freqs, self.num_heads)
+            v_rope = v  # value is shared (no positional encoding)
+
+            # --- PRoPE path: apply camera projection matrices in float32 ---
             q_bnsd = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads).float()
             k_bnsd = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads).float()
             v_bnsd = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads).float()
@@ -208,26 +208,31 @@ class SelfAttention(nn.Module):
             q_prope_bnsd, k_prope_bnsd, v_prope_bnsd, apply_fn_o = self.prope_qkv_fn(
                 q_bnsd, k_bnsd, v_bnsd,
                 viewmats=prope_viewmats.float(),
-                Ks=prope_Ks.float() if prope_Ks is not None else None,
+                Ks=prope_Ks.float(),
                 patches_x=w_patches,
                 patches_y=h_patches,
             )
 
-            # Move PRoPE features back to b s (n d) and cast to original dtype
+            # Cast PRoPE Q/K/V back to original dtype and layout (b, s, n*d)
             q_prope = rearrange(q_prope_bnsd, "b n s d -> b s (n d)").to(orig_dtype)
             k_prope = rearrange(k_prope_bnsd, "b n s d -> b s (n d)").to(orig_dtype)
             v_prope = rearrange(v_prope_bnsd, "b n s d -> b s (n d)").to(orig_dtype)
 
-            # PRoPE attention (reuse self.attn, same backend as RoPE path)
-            out_prope = self.attn(q_prope, k_prope, v_prope)
+            # --- Batched attention: concat along batch dim, one kernel call ---
+            q_all = torch.cat([q_rope, q_prope], dim=0)  # (2b, s, n*d)
+            k_all = torch.cat([k_rope, k_prope], dim=0)
+            v_all = torch.cat([v_rope, v_prope], dim=0)
 
-            # Post-process PRoPE output: apply_fn_o (P matrix) in float32 to
-            # match the float32 P_inv used in prope_qkv_fn, then cast back.
+            out_all = self.attn(q_all, k_all, v_all)      # (2b, s, n*d)
+
+            out_rope, out_prope = out_all.chunk(2, dim=0)  # each (b, s, n*d)
+
+            # Post-process PRoPE output: apply_fn_o (P matrix) in float32
             out_prope_bnsd = rearrange(out_prope, "b s (n d) -> b n s d", n=self.num_heads).float()
             out_prope_bnsd = apply_fn_o(out_prope_bnsd)
             out_prope = rearrange(out_prope_bnsd, "b n s d -> b s (n d)").to(orig_dtype)
 
-            # Project through standard output matching and sum
+            # Project and sum both paths
             x = self.o(out_rope) + self.o_prope(out_prope)
             return x
         else:

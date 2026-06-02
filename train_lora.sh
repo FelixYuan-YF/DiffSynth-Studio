@@ -1,0 +1,36 @@
+CUDA_VISIBLE_DEVICES=2 accelerate launch examples/wanvideo/model_training/train.py \
+  --task grpo \
+  --dataset_base_path "" \
+  --dataset_metadata_path ./your_input_csv.csv \
+  --height 480 \
+  --width 832 \
+  --num_frames 81 \
+  --dataset_repeat 1 \
+  --model_id_with_origin_paths "PAI/Wan2.1-Fun-V1.1-1.3B-Control-Camera:diffusion_pytorch_model*.safetensors,PAI/Wan2.1-Fun-V1.1-1.3B-Control-Camera:models_t5_umt5-xxl-enc-bf16.pth,PAI/Wan2.1-Fun-V1.1-1.3B-Control-Camera:Wan2.1_VAE.pth,PAI/Wan2.1-Fun-V1.1-1.3B-Control-Camera:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
+  --learning_rate 1e-5 \
+  --num_epochs 5 \
+  --frame_rate 5 \
+  --fix_frame_rate \
+  --remove_prefix_in_ckpt "pipe.dit." \
+  --output_path "./models/train/Wan2.1-Fun-V1.1-1.3B-Control-Camera-GRPO" \
+  --lora_base_model "dit" \
+  --lora_target_modules "q,k,v,o,ffn.0,ffn.2" \
+  --lora_rank 32 \
+  --extra_inputs "input_image,camera_control_param" \
+  --pos_encoder "plucker" \
+  --num_generations 4 \
+  --rl_sampling_steps 15 \
+  --rl_eta 1.0 \
+  --rl_shift 5.0 \
+  --rl_cfg_scale 5.0 \
+  --rl_clip_range 1e-4 \
+  --rl_adv_clip_max 5.0 \
+  --rl_timestep_fraction 1.0 \
+  --rl_reward_output_dir "./rl_videos" \
+  --epipolar_sampling_rate 15 \
+  --epipolar_descriptor_type "sift" \
+  --epipolar_ratio_thresh 0.75 \
+  --epipolar_min_matches 20 \
+  --log_backend tensorboard \
+  --log_dir "./logs/Wan2.1-Fun-1.3B-GRPO" \
+  --log_interval 1
